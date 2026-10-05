@@ -2,8 +2,13 @@ import Foundation
 import IOBluetooth
 import BudsKit
 
-let args = Array(CommandLine.arguments.dropFirst())
-let addr = args.first { $0.contains(":") || $0.contains("-") }
+// usage:
+//   budsprobe              list sdp services
+//   budsprobe listen <ch>  open rfcomm channel and dump whatever comes in
+
+var args = Array(CommandLine.arguments.dropFirst())
+let addr = args.first { $0.contains(":") }
+args.removeAll { $0 == addr }
 
 guard let dev = BudsFinder.pairedBuds(address: addr) else {
     print("no buds found in paired devices")
@@ -11,6 +16,7 @@ guard let dev = BudsFinder.pairedBuds(address: addr) else {
 }
 
 print("found: \(dev.name ?? "?")  \(dev.addressString ?? "?")  connected=\(dev.isConnected())")
+setvbuf(stdout, nil, _IOLBF, 0)
 
 
 // MARK: sdp
@@ -38,28 +44,71 @@ func uuidList(_ rec: IOBluetoothSDPServiceRecord) -> [String] {
     return out
 }
 
-let waiter = SDPWaiter()
-let res = dev.performSDPQuery(waiter)
+func listServices() {
+    let waiter = SDPWaiter()
+    let res = dev.performSDPQuery(waiter)
 
-if res != kIOReturnSuccess {
-    print("couldnt start sdp query (\(res)), using cached records")
-    waiter.done = true
+    if res != kIOReturnSuccess {
+        print("couldnt start sdp query (\(res)), using cached records")
+        waiter.done = true
+    }
+
+    let deadline = Date().addingTimeInterval(15)
+    while !waiter.done && Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
+
+    let recs = (dev.services as? [IOBluetoothSDPServiceRecord]) ?? []
+    print("\n\(recs.count) service records\n")
+
+    for r in recs {
+        var ch: BluetoothRFCOMMChannelID = 0
+        let hasCh = r.getRFCOMMChannelID(&ch) == kIOReturnSuccess
+
+        let name = r.getServiceName() ?? "(no name)"
+        print("- \(name)")
+        print("    rfcomm: \(hasCh ? String(ch) : "none")")
+        print("    uuids:  \(uuidList(r).joined(separator: ", "))")
+    }
 }
 
-let deadline = Date().addingTimeInterval(15)
-while !waiter.done && Date() < deadline {
-    RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+
+// MARK: listen
+
+func listen(_ ch: BluetoothRFCOMMChannelID, seconds: Double) {
+    let link = RfcommLink(device: dev)
+    link.onClose = { print("channel closed by buds") }
+
+    do {
+        try link.open(channel: ch)
+    } catch {
+        print("open failed: \(error)")
+        exit(2)
+    }
+    print("opened ch \(ch), listening \(Int(seconds))s (ctrl-c to stop)\n")
+
+    let start = Date()
+    Task {
+        for await chunk in link.incoming {
+            let t = String(format: "%7.3f", Date().timeIntervalSince(start))
+            print("[\(t)] <- (\(chunk.count)) \(chunk.hex)")
+        }
+    }
+
+    RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+    link.close()
 }
 
-let recs = (dev.services as? [IOBluetoothSDPServiceRecord]) ?? []
-print("\n\(recs.count) service records\n")
 
-for r in recs {
-    var ch: BluetoothRFCOMMChannelID = 0
-    let hasCh = r.getRFCOMMChannelID(&ch) == kIOReturnSuccess
+switch args.first {
+case "listen":
+    guard args.count > 1, let n = UInt8(args[1]) else {
+        print("usage: budsprobe listen <channel> [seconds]")
+        exit(1)
+    }
+    let secs = args.count > 2 ? Double(args[2]) ?? 60 : 60
+    listen(n, seconds: secs)
 
-    let name = r.getServiceName() ?? "(no name)"
-    print("- \(name)")
-    print("    rfcomm: \(hasCh ? String(ch) : "none")")
-    print("    uuids:  \(uuidList(r).joined(separator: ", "))")
+default:
+    listServices()
 }
